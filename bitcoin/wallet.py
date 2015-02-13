@@ -1,45 +1,5 @@
-from util import btc_to_satoshi
-from util import satoshi_to_btc
-from bitcoin import *
+# -*- coding: utf-8 -*-
 from api_facade import ApiFacade
-
-
-def get_balance(unspent):
-    """get balance from the unspent BTC
-    """
-    balance = 0
-    for u in unspent:
-        balance += u['value']
-    return balance
-
-
-def simple_tx_inputs_outputs(from_addr, from_addr_unspent, to_addr, amount_to_send, txfee):
-    """
-    """
-    selected_unspent = select(from_addr_unspent, amount_to_send + txfee)
-    selected_unspent_bal = get_balance(selected_unspent)
-    changeval = selected_unspent_bal - amount_to_send - txfee
-
-    if to_addr[0] == 'v' or to_addr[0] == 'w':
-        # stealth
-        ephem_privkey = bc.random_key()
-        nonce = int(bc.random_key()[:8], 16)
-        if to_addr[0] == 'v':
-            # network = 'btc'
-            raise Exception(
-                'Stealth address payments only supported on testnet at this time.')
-        else:
-            network = 'testnet'
-
-        tx_outs = bc.mk_stealth_tx_outputs(
-            to_addr, amount_to_send, ephem_privkey, nonce, network)
-    else:
-        tx_outs = [{'value': amount_to_send, 'address': to_addr}]
-
-    if changeval > 0:
-        tx_outs.append({'value': changeval, 'address': from_addr})
-
-    return selected_unspent, tx_outs
 
 
 class Wallet(object):
@@ -59,9 +19,9 @@ class Wallet(object):
     '''
 
     def __init__(self):
-        self._api = ApiFacade()
-        self.priv = ''
-        self.pub = ''
+        self.api = ApiFacade()
+        self.priKey = ''
+        self.pubKey = ''
         self.address = ''
         self.script = ''
 
@@ -69,61 +29,42 @@ class Wallet(object):
         '''randomly create 4 priv key, and rule a 3 of 4 address
         # NOTE: situation is still not confirm..
         '''
-        privkeys = [random_key() for i in range(4)]
-        pubkeys = [privtopub(key) for key in privkeys]
-        self.priv = privkeys
+        prikeys = [self.api.createPrivateKey() for i in range(4)]
+        pubkeys = [self.api.createPublicKey(key) for key in prikeys]
+        self.priKey = prikeys
+        self.pubKey = pubkeys
+        self.script = self.api.createMultisig(pubkeys, 3, 4)
+        self.address = self.api.createAddressByScript(self.script)
 
-        self.script = mk_multisig_script(pubkeys, 3, 4)
-        self.address = scriptaddr(self.script)
+    def createWallet(self, passphrase=''):
+        if passphrase:
+            self.priKey = self.api.createPrivateKey(passphrase)
+        else:
+            self.priKey = self.api.createPrivateKey()
 
-    def sign_tx(self, to_address, amount, txfee):
-        # if self.send_amount + self.txfee > self.balance:
-        #     raise LowBalanceError("Insufficient funds to send {0} + {1} BTC.".format(
-        #         satoshi_to_btc(self.send_amount), satoshi_to_btc(self.txfee)))
-        unspent_tx = unspent(self.address)
+        self.pubKey = self.api.createPublicKey(self.priKey)
+        self.address = self.api.createAddress(self.pubKey)
 
-        tx_ins, tx_outs = simple_tx_inputs_outputs(
-            self.address, unspent_tx, to_address, amount, txfee)
+    def importPrivateKey(self, privatekey):
+        # TODO:目前先統一使用 wif compressed 格式匯出匯入，未來可以擴充轉換
+        fmt = self.api.getPrivateKeyFormat(privatekey)
+        if 'wif_compressed' != fmt:
+            return 'Error: This is %s type. Must be wif_compressed type.' % fmt
 
-        tx = mktx(tx_ins, tx_outs)
-        # Sign transaction
-        for i in range(len(tx_ins)):
-            tx = sign(tx, i, self.priv)
+        self.priKey = privatekey
+        self.pubKey = self.api.createPublicKey(self.priKey)
+        self.address = self.api.createAddress(self.pubKey)
 
-        return tx_ins, tx_outs, tx, deserialize(tx)
+    def exportPrivateKey(self):
+        return self.api.encodePrivateKey(self.priKey, 'wif_compressed')
 
-    def get_history(self):
-        return self._api.history(self.address)
+    def finalBalance(self):
+        return self.api.finalBalance(self.address)
 
-    def createBrainWallet(self, brainwalletpassword):
-        """according to the password you want.
-        To generate a private key
-        """
-        self.priv = sha256(brainwalletpassword)
-        self.pub = privtopub(self.priv)
-        self.address = pubtoaddr(self.pub)
+    def history(self):
+        return self.api.history(self.address)
 
-    def createWallet(self):
-        """create a wallet with a random key
-        """
-        self.priv = random_key()
-        self.pub = privtopub(self.priv)
-        self.address = pubtoaddr(self.pub)
-
-    def import_privatekey(self, privatekey):
-        '''This is for single key use..
-        '''
-        self.priv = privatekey
-        self.pub = privtopub(self.priv)
-        self.address = privtoaddr(privatekey)
-
-    def export_privatekey(self):
-        return self.priv
-
-    def get_balance(self):
-        return self._api.get_balance(self.address)
-
-    def sendBTC(self, dest, amount, fee=10000):
+    def sendBTC(self, dstAddr, amount, fee=10000):
         '''In order to send money, we need to get the previous transaction history
         and then make an out rule, sign the transactions
 
@@ -131,20 +72,45 @@ class Wallet(object):
         issue: if I import the key from multi-bit, I would not to be able to pushtx
         error message is An outpoint is already spent in. how to solve this
         '''
-        h = history(self.address)
-        # h = self._api.history(self.address)
-        outs = [{'value': amount, 'address': dest}]
-
         if self.address[:1] != '1':
             # if not 1, this address is not multi-sig addr
             # how do I apply fee here..
-            tx = mktx(h, outs)
-            sig1 = multisign(tx, 0, self.script, self.priv[0])
-            sig2 = multisign(tx, 0, self.script, self.priv[1])
-            sig3 = multisign(tx, 0, self.script, self.priv[2])
-            tx2 = apply_multisignatures(tx, 0, self.script, sig1, sig2, sig3)
-            return self._api.pushtx(tx2)
-
+            tx = self.__multiSignTx(dstAddr, amount, fee)
         else:
-            tx = self.sign_tx(dest, amount, fee)[2]
-            return self._api.pushtx(tx)
+            tx = self.__singleSignTx(dstAddr, amount, fee)
+
+        return self.api.sendTx(tx)
+
+    # Single-sign transaction
+    def __singleSignTx(self, dstAddr, amount, txFee):
+        # if self.send_amount + self.txfee > self.balance:
+        #     raise LowBalanceError("Insufficient funds to send")
+        priKey = self.priKey
+        srcAddr = self.address
+
+        txIns, txOuts = self.api.singleSignTxInOut(srcAddr, dstAddr, amount, txFee)
+
+        tx = self.api.createTx(txIns, txOuts)
+        for i in range(len(txIns)):
+            tx = self.api.singleSign(tx, i, priKey)
+
+        # txIns, txOuts, tx, deserialize(tx)
+        self.txIns = txIns
+        self.txOuts = txOuts
+        self.tx = tx
+        return tx
+
+    # Multi-sign transaction
+    def __multiSignTx(self, dstAddr, amount, txFee):
+        priKey = self.priKey
+        srcAddr = self.address
+        script = self.script
+
+        txIns, txOuts = self.api.multiSignTxInOut(srcAddr, dstAddr, amount, txFee)
+
+        tx = self.api.createTx(txIns, txOuts)
+        sig1 = self.api.multiSign(tx, 0, script, priKey[0])
+        sig2 = self.api.multiSign(tx, 0, script, priKey[1])
+        sig3 = self.api.multiSign(tx, 0, script, priKey[2])
+        tx = self.api.applyMultiSign(tx, 0, script, sig1, sig2, sig3)
+        return tx
